@@ -1,2 +1,112 @@
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 .\f_retail\Scripts\Activate.ps1
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import cv2
+import json
+import os
+
+# Load models
+faceProto = "opencv_face_detector.pbtxt"
+faceModel = "opencv_face_detector_uint8.pb"
+ageProto = "age_deploy.prototxt"
+ageModel = "age_net.caffemodel"
+genderProto = "gender_deploy.prototxt"
+genderModel = "gender_net.caffemodel"
+
+MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+ageList = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+genderList = ['Male', 'Female']
+
+faceNet = cv2.dnn.readNet(faceModel, faceProto)
+ageNet = cv2.dnn.readNet(ageModel, ageProto)
+genderNet = cv2.dnn.readNet(genderModel, genderProto)
+
+# FastAPI app
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update with frontend origin in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API response model
+class PersonResponse(BaseModel):
+    gender: str
+    age_group: str
+    matched_ads: list
+
+def detect_person():
+    padding = 20
+    cap = cv2.VideoCapture(0)
+    has_frame, frame = cap.read()
+    cap.release()
+    if not has_frame:
+        return None
+
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [104, 117, 123], True, False)
+    faceNet.setInput(blob)
+    detections = faceNet.forward()
+
+    frameHeight = frame.shape[0]
+    frameWidth = frame.shape[1]
+
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.7:
+            x1 = int(detections[0, 0, i, 3] * frameWidth)
+            y1 = int(detections[0, 0, i, 4] * frameHeight)
+            x2 = int(detections[0, 0, i, 5] * frameWidth)
+            y2 = int(detections[0, 0, i, 6] * frameHeight)
+
+            face = frame[max(0, y1-padding):min(y2+padding, frame.shape[0]-1),
+                         max(0, x1-padding):min(x2+padding, frame.shape[1]-1)]
+
+            face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+
+            # Gender Prediction
+            genderNet.setInput(face_blob)
+            gender_preds = genderNet.forward()
+            gender = genderList[gender_preds[0].argmax()]
+
+            # Age Prediction
+            ageNet.setInput(face_blob)
+            age_preds = ageNet.forward()
+            age = ageList[age_preds[0].argmax()].strip('()')
+
+            print(f"Detected Gender: {gender}, Age Group: {age}")
+            return {"gender": gender, "age_group": age}
+
+    print("No face detected.")
+    return None
+
+def load_ads():
+    with open("ads.json", "r") as file:
+        return json.load(file)
+
+@app.get("/detect_person", response_model=PersonResponse)
+def detect_and_get_ads():
+    person = detect_person()
+    if not person:
+        return JSONResponse(status_code=404, content={"message": "No face detected"})
+
+    ads = load_ads()
+    filtered = [
+        ad for ad in ads
+        if ad["gender"] == person["gender"] and ad["age_group"] == person["age_group"]
+    ]
+
+    print(f"Filtered Ads: {filtered}")
+
+    return {
+        "gender": person["gender"],
+        "age_group": person["age_group"],
+        "matched_ads": filtered
+    }
