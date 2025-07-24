@@ -1,183 +1,123 @@
+# main.py
 import cv2
-from ultralytics import YOLO
-from deepface import DeepFace
+import threading
+import time
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Load YOLOv8 face detection model
-model = YOLO("yolov8n-face-lindevs.pt")  # or yolov8n.pt and filter person
+app = FastAPI()
 
-# Define function to display ad
-def show_ad(gender, age_bucket):
-    print(f"Showing ad for {gender}, Age: {age_bucket}")
-    if gender == 'Male':
-        ad_file = 'ads/men_young.jpg' if age_bucket in ['(15-20)', '(25-32)'] else 'ads/men_mature.jpg'
+# Enable CORS for frontend access (important for browser fetch calls)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables to hold latest gender and age
+latest_gender = "Unknown"
+latest_age = "Unknown"
+
+# Load models
+faceProto = "opencv_face_detector.pbtxt"
+faceModel = "opencv_face_detector_uint8.pb"
+ageProto = "age_deploy.prototxt"
+ageModel = "age_net.caffemodel"
+genderProto = "gender_deploy.prototxt"
+genderModel = "gender_net.caffemodel"
+
+faceNet = cv2.dnn.readNet(faceModel, faceProto)
+ageNet = cv2.dnn.readNet(ageModel, ageProto)
+genderNet = cv2.dnn.readNet(genderModel, genderProto)
+
+ageList = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)',
+           '(38-43)', '(48-53)', '(60-100)']
+genderList = ['Male', 'Female']
+MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+
+camera_running = False
+
+# --------------------------
+# Face Detection Logic
+# --------------------------
+def detect_face_attributes():
+    global latest_gender, latest_age, camera_running
+
+    cap = cv2.VideoCapture(0)
+    camera_running = True
+
+    while camera_running:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        # Face detection
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
+                                     [104, 117, 123], False, False)
+        faceNet.setInput(blob)
+        detections = faceNet.forward()
+
+        h, w = frame.shape[:2]
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > 0.7:
+                box = detections[0, 0, i, 3:7] * [w, h, w, h]
+                x1, y1, x2, y2 = box.astype(int)
+
+                face = frame[y1:y2, x1:x2]
+                if face.size == 0:
+                    continue
+
+                face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227),
+                                                  MODEL_MEAN_VALUES, swapRB=False)
+                # Gender
+                genderNet.setInput(face_blob)
+                gender_preds = genderNet.forward()
+                latest_gender = genderList[gender_preds[0].argmax()]
+
+                # Age
+                ageNet.setInput(face_blob)
+                age_preds = ageNet.forward()
+                latest_age = ageList[age_preds[0].argmax()]
+
+                print(f"[INFO] Gender: {latest_gender}, Age: {latest_age}")
+
+        time.sleep(1)  # Limit processing frequency
+
+    cap.release()
+
+
+# --------------------------
+# Start Camera API
+# --------------------------
+@app.get("/start_camera")
+def start_camera():
+    global camera_running
+    if not camera_running:
+        thread = threading.Thread(target=detect_face_attributes, daemon=True)
+        thread.start()
+        return {"message": "Camera started and running in background."}
     else:
-        ad_file = 'ads/women_young.jpg' if age_bucket in ['(15-20)', '(25-32)'] else 'ads/women_mature.jpg'
-
-    ad_img = cv2.imread(ad_file)
-    if ad_img is not None:
-        cv2.imshow("Advertisement", ad_img)
-        cv2.waitKey(5000)
-        cv2.destroyWindow("Advertisement")
-    else:
-        print("Ad not found:", ad_file)
-
-# Use DeepFace to detect age and gender
-def predict_age_gender_pytorch(face_img):
-    analysis = DeepFace.analyze(face_img, actions=['age', 'gender'], enforce_detection=False)
-    age = analysis[0]['age']
-    gender = analysis[0]['gender']
-    gender = 'Male' if gender == 'Man' else 'Female'
-
-    # Bucket the age
-    if age < 3:
-        age_bucket = "(0-2)"
-    elif age < 7:
-        age_bucket = "(4-6)"
-    elif age < 13:
-        age_bucket = "(8-12)"
-    elif age < 21:
-        age_bucket = "(15-20)"
-    elif age < 35:
-        age_bucket = "(25-32)"
-    elif age < 45:
-        age_bucket = "(38-43)"
-    elif age < 55:
-        age_bucket = "(48-53)"
-    else:
-        age_bucket = "(60-100)"
-        
-    return gender, age_bucket
-
-# Webcam stream
-cap = cv2.VideoCapture(0)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    results = model(frame)
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-            face_img = frame[y1:y2, x1:x2]
-            if face_img.size == 0:
-                continue
-
-            # Predict age and gender with PyTorch model
-            gender, age_bucket = predict_age_gender_pytorch(face_img)
-
-            label = f"{gender}, {age_bucket}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-            cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-
-            show_ad(gender, age_bucket)
-            break  # show one ad per frame
-
-    cv2.imshow("Camera Feed", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        return {"message": "Camera is already running."}
 
 
-'''import cv2
-import numpy as np
-import tensorflow as tf
-from ultralytics import YOLO
+# --------------------------
+# Get Person Details API
+# --------------------------
+class PersonResponse(BaseModel):
+    gender: str
+    age_group: str
 
-# Load your Keras models
-age_model = tf.keras.models.load_model('age_model.h5')
-gender_model = tf.keras.models.load_model('gender_model.h5')
+@app.get("/get_person_details", response_model=PersonResponse)
+def get_person_details():
+    return {
+        "gender": latest_gender,
+        "age_group": latest_age
+    }
 
-# Load YOLOv8 face detection model
-face_detector = YOLO("yolov8n-face-lindevs.pt")
 
-# Age bucketing
-def get_age_bucket(age):
-    if age < 3:
-        return "(0-2)"
-    elif age < 7:
-        return "(4-6)"
-    elif age < 13:
-        return "(8-12)"
-    elif age < 21:
-        return "(15-20)"
-    elif age < 35:
-        return "(25-32)"
-    elif age < 45:
-        return "(38-43)"
-    elif age < 55:
-        return "(48-53)"
-    else:
-        return "(60-100)"
 
-# Display ad based on prediction
-def show_ad(gender, age_bucket):
-    print(f"Showing ad for {gender}, Age Bucket: {age_bucket}")
-    if gender == 'Male':
-        ad_path = 'ads/men_young.jpg' if age_bucket in ['(15-20)', '(25-32)'] else 'ads/men_mature.jpg'
-    else:
-        ad_path = 'ads/women_young.jpg' if age_bucket in ['(15-20)', '(25-32)'] else 'ads/women_mature.jpg'
-    
-    ad_img = cv2.imread(ad_path)
-    if ad_img is not None:
-        cv2.imshow("Advertisement", ad_img)
-        cv2.waitKey(5000)
-        cv2.destroyWindow("Advertisement")
-    else:
-        print("Ad image not found:", ad_path)
 
-# Preprocess face for Keras models
-def preprocess_face_for_keras(face_img):
-    resized = cv2.resize(face_img, (224, 224))
-    normalized = resized / 255.0
-    return np.expand_dims(normalized, axis=0)
-
-# Predict age and gender
-def predict_age_gender(face_img):
-    face_input = preprocess_face_for_keras(face_img)
-    predicted_age = age_model.predict(face_input)[0][0]
-    gender_prob = gender_model.predict(face_input)[0][0]
-    predicted_gender = 'Male' if gender_prob < 0.5 else 'Female'
-    age_bucket = get_age_bucket(predicted_age)
-    return predicted_gender, age_bucket, predicted_age
-
-# Start webcam
-cap = cv2.VideoCapture(0)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    # Face detection using YOLO
-    results = face_detector(frame)
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-            face_img = frame[y1:y2, x1:x2]
-            if face_img.size == 0:
-                continue
-
-            # Predict age and gender
-            gender, age_bucket, raw_age = predict_age_gender(face_img)
-
-            # Draw rectangle and label
-            label = f"{gender}, {int(raw_age)}y"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-            # Show ad (only once per detected face)
-            show_ad(gender, age_bucket)
-            break  # Show ad for first face only
-
-    cv2.imshow("Camera Feed", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-'''
