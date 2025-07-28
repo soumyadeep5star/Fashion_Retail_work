@@ -1,14 +1,15 @@
-# main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import cv2
 import threading
 import time
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import numpy as np
+import face_recognition
 
 app = FastAPI()
 
-# Enable CORS for frontend access (important for browser fetch calls)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,11 +18,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables to hold latest gender and age
-latest_gender = "Unknown"
-latest_age = "Unknown"
+# Globals
+drawing = False
+roi_start = None
+roi_end = None
+roi_defined = False
+camera_thread = None
+running = False
+gender_age_data = {"gender": None, "age": None}
+prev_face_embedding = None
 
-# Load models
+# Pretrained model paths
 faceProto = "opencv_face_detector.pbtxt"
 faceModel = "opencv_face_detector_uint8.pb"
 ageProto = "age_deploy.prototxt"
@@ -29,95 +36,278 @@ ageModel = "age_net.caffemodel"
 genderProto = "gender_deploy.prototxt"
 genderModel = "gender_net.caffemodel"
 
+
+GENDER_LIST = ['Male', 'Female']
+AGE_LIST = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+
+
+# Load models
 faceNet = cv2.dnn.readNet(faceModel, faceProto)
 ageNet = cv2.dnn.readNet(ageModel, ageProto)
 genderNet = cv2.dnn.readNet(genderModel, genderProto)
 
-ageList = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)',
-           '(38-43)', '(48-53)', '(60-100)']
-genderList = ['Male', 'Female']
-MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 
-camera_running = False
+def draw_roi(event, x, y, flags, param):
+    global drawing, roi_start, roi_end, roi_defined
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        roi_start = (x, y)
+    elif event == cv2.EVENT_MOUSEMOVE and drawing:
+        roi_end = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        roi_end = (x, y)
+        roi_defined = True
+        print(f"[INFO] ROI set from {roi_start} to {roi_end}")
 
-# --------------------------
-# Face Detection Logic
-# --------------------------
-def detect_face_attributes():
-    global latest_gender, latest_age, camera_running
+def detect_face_attributes(frame):
+    global gender_age_data, prev_face_embedding
+    (h, w) = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
+                                 (300, 300), (104.0, 177.0, 123.0))
+    faceNet.setInput(blob)
+    detections = faceNet.forward()
 
-    cap = cv2.VideoCapture(0)
-    camera_running = True
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.7:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (x1, y1, x2, y2) = box.astype("int")
 
-    while camera_running:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        # Face detection
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300),
-                                     [104, 117, 123], False, False)
-        faceNet.setInput(blob)
-        detections = faceNet.forward()
-
-        h, w = frame.shape[:2]
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence > 0.7:
-                box = detections[0, 0, i, 3:7] * [w, h, w, h]
-                x1, y1, x2, y2 = box.astype(int)
-
-                face = frame[y1:y2, x1:x2]
-                if face.size == 0:
+            if roi_defined:
+                if not (roi_start[0] < x1 < roi_end[0] and roi_start[1] < y1 < roi_end[1]):
                     continue
 
-                face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227),
-                                                  MODEL_MEAN_VALUES, swapRB=False)
-                # Gender
-                genderNet.setInput(face_blob)
-                gender_preds = genderNet.forward()
-                latest_gender = genderList[gender_preds[0].argmax()]
+            face_img = frame[y1:y2, x1:x2]
+            if face_img.size == 0:
+                continue
 
-                # Age
-                ageNet.setInput(face_blob)
-                age_preds = ageNet.forward()
-                latest_age = ageList[age_preds[0].argmax()]
+            # Check for new face using face embeddings
+            try:
+                rgb_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+                encodings = face_recognition.face_encodings(rgb_face)
+                if not encodings:
+                    print("not encoding")
+                    continue
+                current_embedding = encodings[0]
+                if prev_face_embedding is not None:
+                    dist = np.linalg.norm(prev_face_embedding - current_embedding)
+                    if dist < 0.6:
+                        print("<0.6")
+                        continue  # Same person
+                prev_face_embedding = current_embedding
+                print("Good man")
 
-                print(f"[INFO] Gender: {latest_gender}, Age: {latest_age}")
+            except:
+                print("Bad man")
+                continue
 
-        time.sleep(1)  # Limit processing frequency
+            # Predict gender
+            face_blob = cv2.dnn.blobFromImage(face_img, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+            genderNet.setInput(face_blob)
+            gender_preds = genderNet.forward()
+            gender = GENDER_LIST[gender_preds[0].argmax()]
+
+            # Predict age
+            ageNet.setInput(face_blob)
+            age_preds = ageNet.forward()
+            age = AGE_LIST[age_preds[0].argmax()]
+
+            gender_age_data["gender"] = gender
+            gender_age_data["age"] = age
+            print(f"[INFO] New Person - Gender: {gender}, Age: {age}")
+            break
+
+def camera_worker():
+    global running
+    cap = cv2.VideoCapture(0)
+    cv2.namedWindow("Camera")
+    cv2.setMouseCallback("Camera", draw_roi)
+
+    while running:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if roi_defined:
+            cv2.rectangle(frame, roi_start, roi_end, (0, 255, 0), 2)
+            detect_face_attributes(frame)
+
+        cv2.imshow("Camera", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        time.sleep(1)
 
     cap.release()
+    cv2.destroyAllWindows()
+
+@app.get("/start_system")
+def start_system():
+    global running, camera_thread
+    if not running:
+        running = True
+        camera_thread = threading.Thread(target=camera_worker)
+        camera_thread.start()
+    return {"message": "System started"}
+
+@app.get("/get_person_details")
+def get_person_details():
+    if gender_age_data["gender"] and gender_age_data["age"]:
+        return gender_age_data
+    return JSONResponse(status_code=404, content={"message": "No person detected"})
 
 
-# --------------------------
-# Start Camera API
-# --------------------------
-@app.get("/start_camera")
-def start_camera():
-    global camera_running
-    if not camera_running:
-        thread = threading.Thread(target=detect_face_attributes, daemon=True)
-        thread.start()
-        return {"message": "Camera started and running in background."}
-    else:
-        return {"message": "Camera is already running."}
 
 
-# --------------------------
-# Get Person Details API
-# --------------------------
+
+
+
+
+'''from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+import cv2
+import threading
+import numpy as np
+import face_recognition
+
+app = FastAPI()
+
+# Shared variables
+latest_gender = None
+latest_age_group = None
+lock = threading.Lock()
+roi = None
+prev_embedding = None
+
+# Pretrained model paths
+faceProto = "opencv_face_detector.pbtxt"
+faceModel = "opencv_face_detector_uint8.pb"
+ageProto = "age_deploy.prototxt"
+ageModel = "age_net.caffemodel"
+genderProto = "gender_deploy.prototxt"
+genderModel = "gender_net.caffemodel"
+
+# Model Mean Values and Labels
+MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+ageList = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+genderList = ['Male', 'Female']
+
+# Load models
+faceNet = cv2.dnn.readNet(faceModel, faceProto)
+ageNet = cv2.dnn.readNet(ageModel, ageProto)
+genderNet = cv2.dnn.readNet(genderModel, genderProto)
+
+drawing = False
+roi_start = (0, 0)
+roi_end = (0, 0)
+roi_defined = False
+
+
 class PersonResponse(BaseModel):
     gender: str
     age_group: str
 
+
+def draw_roi(event, x, y, flags, param):
+    global drawing, roi_start, roi_end, roi_defined
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        roi_start = (x, y)
+    elif event == cv2.EVENT_MOUSEMOVE and drawing:
+        roi_end = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        roi_end = (x, y)
+        roi_defined = True
+        print(f"[INFO] ROI set from {roi_start} to {roi_end}")
+
+
+def detect_face_attributes():
+    global latest_gender, latest_age_group, roi, roi_start, roi_end, roi_defined, prev_embedding
+
+    cap = cv2.VideoCapture(0)
+    cv2.namedWindow("Draw ROI")
+    cv2.setMouseCallback("Draw ROI", draw_roi)
+
+    # Wait until ROI is drawn
+    while not roi_defined:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        temp_frame = frame.copy()
+        if drawing:
+            cv2.rectangle(temp_frame, roi_start, roi_end, (255, 0, 0), 2)
+        cv2.imshow("Draw ROI", temp_frame)
+        if cv2.waitKey(1) == 27:
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+    cv2.destroyWindow("Draw ROI")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        x1, y1 = roi_start
+        x2, y2 = roi_end
+        roi_frame = frame[y1:y2, x1:x2]
+
+        blob = cv2.dnn.blobFromImage(roi_frame, 1.0, (300, 300), [104, 117, 123], True, False)
+        faceNet.setInput(blob)
+        detections = faceNet.forward()
+
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > 0.7:
+                fx1 = int(detections[0, 0, i, 3] * roi_frame.shape[1])
+                fy1 = int(detections[0, 0, i, 4] * roi_frame.shape[0])
+                fx2 = int(detections[0, 0, i, 5] * roi_frame.shape[1])
+                fy2 = int(detections[0, 0, i, 6] * roi_frame.shape[0])
+                face = roi_frame[fy1:fy2, fx1:fx2]
+
+                # Gender detection
+                face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+                genderNet.setInput(face_blob)
+                gender_preds = genderNet.forward()
+                gender = genderList[gender_preds[0].argmax()]
+
+                # Age detection
+                ageNet.setInput(face_blob)
+                age_preds = ageNet.forward()
+                age = ageList[age_preds[0].argmax()]
+
+                with lock:
+                    latest_gender = gender
+                    latest_age_group = age
+
+                print(f"[INFO] Gender: {gender}, Age: {age}")        
+
+                        
+
+                cv2.rectangle(roi_frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
+
+        cv2.rectangle(frame, roi_start, roi_end, (255, 0, 0), 2)
+        cv2.imshow("Camera", frame)
+        if cv2.waitKey(1) == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+@app.get("/start_system")
+def start_system():
+    threading.Thread(target=detect_face_attributes, daemon=True).start()
+    return {"message": "System started, camera running in background"}
+
+
 @app.get("/get_person_details", response_model=PersonResponse)
 def get_person_details():
-    return {
-        "gender": latest_gender,
-        "age_group": latest_age
-    }
-
-
-
-
+    with lock:
+        if latest_gender and latest_age_group:
+            return PersonResponse(gender=latest_gender, age_group=latest_age_group)
+        else:
+            return JSONResponse(status_code=404, content={"message": "No face detected yet"})'''
