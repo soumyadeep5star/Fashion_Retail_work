@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 import cv2
 import threading
 import numpy as np
+import time
 import face_recognition
 
 app = FastAPI()
@@ -58,7 +59,7 @@ def draw_roi(event, x, y, flags, param):
         print(f"[INFO] ROI set from {roi_start} to {roi_end}")
 
 
-def detect_face_attributes():
+'''def detect_face_attributes():
     global latest_gender, latest_age_group, roi, roi_start, roi_end, roi_defined, prev_embedding
 
     cap = cv2.VideoCapture(0)
@@ -127,14 +128,80 @@ def detect_face_attributes():
         cv2.imshow("Camera", frame)
         if cv2.waitKey(1) == 27:
             break
+        time.sleep(2)
+    cap.release()
+    cv2.destroyAllWindows()'''
+
+def detect_person_background():
+    global latest_gender, latest_age_group, detection_thread_running
+
+    cap = cv2.VideoCapture(0)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        height, width = frame.shape[:2]
+
+        # Define ROI centered on screen (e.g., 50% of width and height)
+        roi_w, roi_h = int(width * 0.5), int(height * 0.5)
+        x1 = (width - roi_w) // 2
+        y1 = (height - roi_h) // 2
+        x2 = x1 + roi_w
+        y2 = y1 + roi_h
+
+        roi = frame[y1:y2, x1:x2]
+
+        # Run face detection in ROI
+        blob = cv2.dnn.blobFromImage(roi, 1.0, (300, 300), [104, 117, 123], True, False)
+        faceNet.setInput(blob)
+        detections = faceNet.forward()
+
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > 0.7:
+                fx1 = int(detections[0, 0, i, 3] * roi.shape[1])
+                fy1 = int(detections[0, 0, i, 4] * roi.shape[0])
+                fx2 = int(detections[0, 0, i, 5] * roi.shape[1])
+                fy2 = int(detections[0, 0, i, 6] * roi.shape[0])
+                face = roi[fy1:fy2, fx1:fx2]
+
+                if face.size == 0:
+                    continue
+
+                face_blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+
+                genderNet.setInput(face_blob)
+                genderPreds = genderNet.forward()
+                latest_gender = genderList[genderPreds[0].argmax()]
+
+                ageNet.setInput(face_blob)
+                agePreds = ageNet.forward()
+                latest_age_group = ageList[agePreds[0].argmax()]
+
+                print(f"[DETECTED] Gender: {latest_gender}, Age: {latest_age_group}")
+
+        # Draw ROI box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        #cv2.putText(frame, "Centered ROI", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        cv2.imshow("Camera", frame)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+        time.sleep(1)
 
     cap.release()
     cv2.destroyAllWindows()
+    detection_thread_running = False
+
 
 
 @app.get("/start_system")
 def start_system():
-    threading.Thread(target=detect_face_attributes, daemon=True).start()
+    threading.Thread(target=detect_person_background, daemon=True).start()
     return {"message": "System started, camera running in background"}
 
 
